@@ -1,14 +1,14 @@
 {
-  "builds": [
-    {
-      "src": "api/main.py",
-      "use": "@vercel/python"
+  "functions": {
+    "api/main.py": {
+      "runtime": "python3.10",
+      "maxDuration": 30
     }
-  ],
-  "routes": [
+  },
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "api/main.py"
+      "source": "/(.*)",
+      "destination": "api/main.py"
     }
   ]
 }
