@@ -9,5 +9,6 @@ dependencies = [
     "litellm>=1.81.13",
     "mistralai>=1.12.2",
     "pymupdf4llm>=0.3.4",
+    "pypdf>=6.7.0",
     "uvicorn>=0.41.0",
 ]

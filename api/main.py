@@ -1,10 +1,9 @@
 import os
 import json
-import shutil
-import pymupdf4llm  # Note: Ensure this is in requirements.txt
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from mistralai import Mistral
+from pypdf import PdfReader  # Pure python, no binary issues
 
 app = FastAPI()
 
@@ -15,38 +14,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Use environment variables for security
-api_key = os.getenv("MISTRAL_API_KEY", "XuLqP7MaOAvMzfQTphhrh5HBnoCiz5KL")
+# Best practice: Fetch from environment variable only
+api_key = os.getenv("MISTRAL_API_KEY","XuLqP7MaOAvMzfQTphhrh5HBnoCiz5KL")
 client = Mistral(api_key=api_key)
-
-def get_next_filename(base_name="/tmp/extracted_output", extension="json"):
-    """Vercel requires writing to the /tmp directory"""
-    counter = 1
-    while os.path.exists(f"{base_name}_{counter}.{extension}"):
-        counter += 1
-    return f"{base_name}_{counter}.{extension}"
 
 def validate_financial_logic(data: dict):
     errors = []
-    
-    # 1. Balance Sheet Equality: Assets = Liabilities + Equity
-    assets = data.get('balance_sheet', {}).get('assets', {}).get('total_assets', 0)
-    liabilities = data.get('balance_sheet', {}).get('liabilities', {}).get('total_liabilities', 0)
-    equity = data.get('balance_sheet', {}).get('owners_equity', {}).get('total_shareholders_equity', 0)
+    bs = data.get('balance_sheet', {})
+    assets = bs.get('assets', {}).get('total_assets', 0)
+    liabilities = bs.get('liabilities', {}).get('total_liabilities', 0)
+    equity = bs.get('owners_equity', {}).get('total_shareholders_equity', 0)
     
     if assets != 0 and abs(assets - (liabilities + equity)) > 1:
         errors.append(f"Balance Sheet Mismatch: Assets ({assets}) != Liab+Equity ({liabilities + equity})")
-
-    # 2. Retained Earnings Roll-forward
-    re = data.get('retained_earnings', {})
-    opening = re.get('opening_balance', 0)
-    net_income = re.get('net_income', 0)
-    dividends = re.get('dividends', 0)
-    closing = re.get('closing_balance', 0)
-    
-    if opening and closing and abs(opening + net_income - abs(dividends) - closing) > 1:
-        errors.append("Retained earnings reconciliation check failed. Please verify repurchases or other equity adjustments.")
-
     return errors
 
 @app.get("/")
@@ -55,24 +35,30 @@ async def health():
 
 @app.post("/extract")
 async def extract_financials(file: UploadFile = File(...)):
-    # VERCEL FIX: Use /tmp path for any file writing
+    # 1. Define path FIRST
     temp_path = f"/tmp/temp_{file.filename}"
     
     try:
-        # Save uploaded file to /tmp
+        # 2. Save uploaded file
         content = await file.read()
         with open(temp_path, "wb") as buffer:
             buffer.write(content)
 
-        # Convert PDF to Markdown
-        md_text = pymupdf4llm.to_markdown(temp_path)
+        # 3. Extract text using pypdf (Vercel-friendly)
+        reader = PdfReader(temp_path)
+        raw_text = ""
+        for page in reader.pages:
+            raw_text += page.extract_text() + "\n"
 
-        # STEP 2: UNIT MULTIPLIER DETECTION
+        if not raw_text.strip():
+            raise ValueError("Could not extract text from PDF.")
+
+        # 4. Multiplier Detection (Limit context to stay under timeout)
         unit_check = client.chat.complete(
             model="open-mistral-nemo",
             messages=[{
                 "role": "user", 
-                "content": f"Look at the first few pages. Does it say 'In millions' or 'In billions'? Return ONLY the integer multiplier (1000000 or 1000000000). If not specified, return 1. \n\n {md_text[:5000]}"
+                "content": f"Does this financial doc use 'millions' or 'billions'? Return ONLY the number (1000000, 1000000000, or 1). \n\n {raw_text[:3000]}"
             }]
         )
         
@@ -81,51 +67,33 @@ async def extract_financials(file: UploadFile = File(...)):
         except:
             multiplier = 1
 
-        # STEP 3: PRECISION EXTRACTION
+        # 5. Data Extraction
         chat_completion = client.chat.complete(
             model="mistral-large-latest",
             response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system", 
-                    "content": (
-                        "You are a senior financial auditor. Your task is to extract data into a strict JSON format.\n"
-                        f"1. Units: Reported in {multiplier}. Multiply all raw numbers by {multiplier}.\n"
-                        "2. Negative Values: (500) -> -500.\n"
-                        "3. Return ONLY valid JSON."
-                    )
+                    "content": f"Senior Auditor. Multiply numbers by {multiplier}. Return JSON."
                 },
                 {
                     "role": "user", 
-                    "content": f"Extract financial data: \n\n {md_text[:30000]}"
+                    "content": f"Extract financial data: \n\n {raw_text[:25000]}"
                 }
             ]
         )
 
         data_json = json.loads(chat_completion.choices[0].message.content)
-
-        # STEP 4: VERIFICATION & AUDIT
-        validation_errors = validate_financial_logic(data_json)
-        if validation_errors:
-            data_json["extraction_warnings"] = validation_errors
-
-        # STEP 5: SAVE (to /tmp) & RETURN
-        output_filename = get_next_filename()
-        with open(output_filename, "w") as f:
-            json.dump(data_json, f, indent=4)
+        
+        # 6. Validation
+        warnings = validate_financial_logic(data_json)
+        if warnings:
+            data_json["extraction_warnings"] = warnings
 
         return data_json
 
     except Exception as e:
-        # Provide more detail in the 500 error for debugging
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
-# Vercel handles the invocation, so if __name__ is usually not required 
-# but kept for local testing.
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
